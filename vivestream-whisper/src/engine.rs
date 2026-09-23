@@ -116,21 +116,34 @@ impl WhisperEngine {
     }
 
     pub fn transcribe_pcm(&mut self, pcm: &[f32]) -> Result<TranscriptionResult, String> {
+        if pcm.is_empty() {
+            return Ok(TranscriptionResult {
+                text: String::new(),
+                language: "en".to_string(),
+                duration: 0.0,
+                segments: Vec::new(),
+            });
+        }
+
+        const N_FRAMES: usize = 3000;
+        const HOP_LENGTH: usize = 160;
+        const SAMPLE_RATE: usize = 16000;
+
+        let total_duration = pcm.len() as f64 / SAMPLE_RATE as f64;
+        let mut all_segments = Vec::new();
+        let mut full_text_parts = Vec::new();
+        let mut segment_id = 0;
+
+        // Compute full mel spectrogram across the audio
         let mel = m_audio::pcm_to_mel(&self.config, pcm, &self.mel_filters);
         let mel_len = mel.len();
+        let total_frames = mel_len / self.config.num_mel_bins;
         let mel_tensor = Tensor::from_vec(
             mel,
-            (1, self.config.num_mel_bins, mel_len / self.config.num_mel_bins),
+            (1, self.config.num_mel_bins, total_frames),
             &self.device,
         )
         .map_err(|e| format!("Failed to create mel tensor: {}", e))?;
-
-        // Encoder pass
-        let encoder_output = self
-            .model
-            .encoder
-            .forward(&mel_tensor, true)
-            .map_err(|e| format!("Encoder forward pass error: {}", e))?;
 
         // Token IDs from tokenizer
         let sot_token = self
@@ -163,98 +176,146 @@ impl WhisperEngine {
         let suppress_t = Tensor::new(suppress_tokens.as_slice(), &self.device)
             .map_err(|e| format!("Suppress tensor error: {}", e))?;
 
-        let mut tokens = vec![sot_token];
-        if let Some(en_id) = self.tokenizer.token_to_id("<|en|>") {
-            tokens.push(en_id);
-        }
-        tokens.push(transcribe_token);
-        tokens.push(no_timestamps_token);
+        let en_id = self.tokenizer.token_to_id("<|en|>");
 
-        let mut segments = Vec::new();
-        let mut words = Vec::new();
-        let mut current_segment_text = String::new();
-
-        // Autoregressive decoding loop (up to max_target_positions)
-        let max_steps = 224;
-        let mut prev_word_time = 0.0f64;
-
-        for _step in 0..max_steps {
-            let tokens_t = Tensor::new(&tokens[..], &self.device)
-                .and_then(|t| t.unsqueeze(0))
-                .map_err(|e| format!("Tensor creation error: {}", e))?;
-
-            let ys = self
-                .model
-                .decoder
-                .forward(&tokens_t, &encoder_output, true)
-                .map_err(|e| format!("Decoder forward error: {}", e))?;
-
-            let (_, seq_len, _) = ys
-                .dims3()
-                .map_err(|e| format!("Decoder dims3 error: {}", e))?;
-
-            // Project hidden state from final layer to vocab logits
-            let logits = self
-                .model
-                .decoder
-                .final_linear(&ys.i((..1, seq_len - 1..)).map_err(|e| format!("{}", e))?)
-                .map_err(|e| format!("Decoder final_linear error: {}", e))?
-                .i(0)
-                .map_err(|e| format!("{}", e))?
-                .i(0)
-                .map_err(|e| format!("{}", e))?;
-
-            let logits = logits
-                .broadcast_add(&suppress_t)
-                .map_err(|e| format!("Suppress add error: {}", e))?;
-
-            // Greedy argmax
-            let next_token = logits
-                .argmax(0)
-                .and_then(|t| t.to_scalar::<u32>())
-                .map_err(|e| format!("Argmax error: {}", e))?;
-
-            if next_token == eot_token {
+        let mut seek = 0;
+        while seek < total_frames {
+            let time_offset = (seek * HOP_LENGTH) as f64 / SAMPLE_RATE as f64;
+            if time_offset >= total_duration {
                 break;
             }
 
-            tokens.push(next_token);
+            let segment_size = usize::min(total_frames - seek, N_FRAMES);
+            let mel_segment = mel_tensor
+                .narrow(2, seek, segment_size)
+                .map_err(|e| format!("Mel segment narrow error: {}", e))?;
 
-            // Decode token to text
-            if let Ok(token_str) = self.tokenizer.decode(&[next_token], true) {
-                if !token_str.is_empty() {
-                    let word_start = prev_word_time;
-                    let word_end = word_start + 0.35; // Estimated word duration
-                    prev_word_time = word_end;
+            let chunk_actual_duration = ((segment_size * HOP_LENGTH) as f64 / SAMPLE_RATE as f64)
+                .min(total_duration - time_offset);
 
-                    words.push(WordTiming {
-                        word: token_str.clone(),
-                        start: word_start,
-                        end: word_end,
-                        probability: 0.95,
-                    });
+            // Encoder pass on this segment
+            let encoder_output = self
+                .model
+                .encoder
+                .forward(&mel_segment, true)
+                .map_err(|e| format!("Encoder forward pass error: {}", e))?;
 
-                    current_segment_text.push_str(&token_str);
+            let mut tokens = vec![sot_token];
+            if let Some(id) = en_id {
+                tokens.push(id);
+            }
+            tokens.push(transcribe_token);
+            tokens.push(no_timestamps_token);
+
+            let mut raw_tokens = Vec::new();
+            let max_steps = 224;
+
+            for _step in 0..max_steps {
+                let tokens_t = Tensor::new(&tokens[..], &self.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| format!("Tensor creation error: {}", e))?;
+
+                let ys = self
+                    .model
+                    .decoder
+                    .forward(&tokens_t, &encoder_output, true)
+                    .map_err(|e| format!("Decoder forward error: {}", e))?;
+
+                let (_, seq_len, _) = ys
+                    .dims3()
+                    .map_err(|e| format!("Decoder dims3 error: {}", e))?;
+
+                // Project hidden state to vocab logits
+                let logits = self
+                    .model
+                    .decoder
+                    .final_linear(&ys.i((..1, seq_len - 1..)).map_err(|e| format!("{}", e))?)
+                    .map_err(|e| format!("Decoder final_linear error: {}", e))?
+                    .i(0)
+                    .map_err(|e| format!("{}", e))?
+                    .i(0)
+                    .map_err(|e| format!("{}", e))?;
+
+                let logits = logits
+                    .broadcast_add(&suppress_t)
+                    .map_err(|e| format!("Suppress add error: {}", e))?;
+
+                // Greedy argmax
+                let next_token = logits
+                    .argmax(0)
+                    .and_then(|t| t.to_scalar::<u32>())
+                    .map_err(|e| format!("Argmax error: {}", e))?;
+
+                if next_token == eot_token {
+                    break;
+                }
+
+                tokens.push(next_token);
+                raw_tokens.push(next_token);
+            }
+
+            // Decode tokens to words with proper time offsets
+            let mut decoded_words: Vec<String> = Vec::new();
+            for &tok in &raw_tokens {
+                if let Ok(w) = self.tokenizer.decode(&[tok], true) {
+                    if !w.trim().is_empty() {
+                        decoded_words.push(w);
+                    }
                 }
             }
+
+            if !decoded_words.is_empty() {
+                let word_count = decoded_words.len();
+                let step_dur = chunk_actual_duration / (word_count as f64);
+                let mut chunk_words = Vec::new();
+                let mut chunk_full_str = String::new();
+
+                for (w_i, w_text) in decoded_words.into_iter().enumerate() {
+                    let clean_word = w_text.trim().to_string();
+                    if clean_word.is_empty() {
+                        continue;
+                    }
+                    let w_start = time_offset + (w_i as f64 * step_dur);
+                    let w_end = w_start + step_dur;
+
+                    let is_punct = clean_word.len() == 1 && clean_word.chars().next().unwrap().is_ascii_punctuation();
+                    if !chunk_full_str.is_empty() && (!is_punct || clean_word == "(" || clean_word == "[") {
+                        chunk_full_str.push(' ');
+                    }
+                    chunk_full_str.push_str(&clean_word);
+
+                    chunk_words.push(WordTiming {
+                        word: clean_word,
+                        start: (w_start * 100.0).round() / 100.0,
+                        end: (w_end * 100.0).round() / 100.0,
+                        probability: 0.95,
+                    });
+                }
+
+                let seg_text = chunk_full_str.trim().to_string();
+                if !seg_text.is_empty() {
+                    full_text_parts.push(seg_text.clone());
+                    all_segments.push(Segment {
+                        id: segment_id,
+                        start: (time_offset * 100.0).round() / 100.0,
+                        end: ((time_offset + chunk_actual_duration) * 100.0).round() / 100.0,
+                        text: seg_text,
+                        words: chunk_words,
+                    });
+                    segment_id += 1;
+                }
+            }
+
+            seek += segment_size;
         }
 
-        let total_duration = pcm.len() as f64 / 16000.0;
-        let full_text = current_segment_text.trim().to_string();
-
-        segments.push(Segment {
-            id: 0,
-            start: 0.0,
-            end: total_duration,
-            text: full_text.clone(),
-            words,
-        });
+        let full_text = full_text_parts.join(" ");
 
         Ok(TranscriptionResult {
             text: full_text,
             language: "en".to_string(),
             duration: total_duration,
-            segments,
+            segments: all_segments,
         })
     }
 }
