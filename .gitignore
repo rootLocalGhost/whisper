@@ -9,3 +9,8 @@ thumbs.db
 .DS_Store
 .idea
 
+# Local model weights and generation outputs
+models/*.pt
+!models/.gitkeep
+outputs/
+test_outputs/
