@@ -21,3 +21,6 @@ test_outputs/
 target/
 vivestream-whisper/target/
 *.exe
+
+# Nested separate project repository
+ViveStream-Next/
