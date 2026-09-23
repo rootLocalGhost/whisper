@@ -128,10 +128,17 @@ def load_model(
     """
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
     if download_root is None:
-        default = os.path.join(os.path.expanduser("~"), ".cache")
-        download_root = os.path.join(os.getenv("XDG_CACHE_HOME", default), "whisper")
+        download_root = os.getenv("WHISPER_MODELS_DIR")
+        if not download_root:
+            workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            download_root = os.path.join(workspace_dir, "models")
 
     if name in _MODELS:
         checkpoint_file = _download(_MODELS[name], download_root, in_memory)
