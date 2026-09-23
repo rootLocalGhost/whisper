@@ -20,3 +20,4 @@ test_outputs/
 # Rust build artifacts
 target/
 vivestream-whisper/target/
+*.exe
