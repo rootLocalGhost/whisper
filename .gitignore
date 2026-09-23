@@ -11,6 +11,12 @@ thumbs.db
 
 # Local model weights and generation outputs
 models/*.pt
+models/*.safetensors
+models/*.bin
 !models/.gitkeep
 outputs/
 test_outputs/
+
+# Rust build artifacts
+target/
+vivestream-whisper/target/
